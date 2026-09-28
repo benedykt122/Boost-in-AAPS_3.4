@@ -103,7 +103,7 @@ know what they are when a dose looks smaller than you expected.
 
 | Setting (as named in the app) | Where | Range (default) | What it does |
 |---|---|---|---|
-| **Boost Bolus Cap** | Boost V6 | 0.1–10 U (2.5) | The largest single bolus Boost will give outside the UAM basal-minutes limit below. Auto-config sets it from your own dosing history. With carbs on board Boost may exceed it, up to the greater of this cap or your carbs on board divided by your carb ratio. |
+| **Boost Bolus Cap** | Boost (the base engine plugin) → Boost base-engine SMB sizing; not shown on the Boost V6 screen | 0.1–10 U (2.5) | The largest single bolus Boost will give outside the UAM basal-minutes limit below. Auto-config sets it to your AAPS maximum bolus. With carbs on board Boost may exceed it, up to the greater of this cap or your carbs on board divided by your carb ratio. |
 | **Max minutes of basal to limit SMB to for UAM** | Preferences → SMB settings | 15–120 min (15) | Sets the ceiling on a single microbolus as a number of minutes of your own basal: the limit is your current basal rate times these minutes, divided by 60. At a basal of 0.6 U/h, 15 minutes is a ceiling of 0.15 U. It applies when the loop is dosing on unannounced meals rather than carbs, so it is mostly an overnight limit and does not need to be large. |
 
 The companion setting **Max Minutes of basal to limit SMB to**, on the same screen and with the same
@@ -116,6 +116,98 @@ and watch what follows.
 Everything else — the cumulative cap, fast-carb confirm, the opt-in aggression levers, DynISF,
 activity — is [advanced and set for you on install](docs/v6-advanced-settings.md). You
 should rarely need to open that page except to understand a value auto-config chose.
+
+## Exercise, activity and recovery
+
+Boost adjusts for activity only while Boost itself is active, which means outside night mode. It
+reads steps from the phone or a watch and, if you turn on heart-rate integration (Wear OS or
+Garmin), heart rate as well. Each cycle it places you in one activity state and changes your
+profile percentage and target to suit. A temporary target you set yourself always takes precedence
+over the target changes below.
+
+| State | How it is detected | What Boost does |
+|---|---|---|
+| Active | more than 420 steps in 5 min, 800 in 15, 1,200 in 30 or 1,800 in 60 | profile to 80% (Activity percentage), target 150 mg/dL (8.3 mmol/L) |
+| Vigorous aerobic | steps as above, at least 300 in the last 15 min, and heart rate zone 3 or higher | profile to 70% (Activity percentage less 10, never below 50%), target 150 mg/dL |
+| Resistance, or raised heart rate with few steps | heart rate zone 3 or 4 with fewer than 100 steps in 15 min | no profile reduction, target 160 mg/dL (8.9 mmol/L) |
+| Stress (opt-in) | heart rate zone 2 or 3 with fewer than 30 steps in 15 min | target 160 mg/dL |
+| Inactive | fewer than 500 steps in the last hour, awake, outside the night window | profile to 130% (Inactivity percentage), which adds insulin |
+| No step data | the step feed has gone quiet | nothing changes; a dark feed is not read as inactivity |
+
+The inactive row is the only one that adds insulin. With heart-rate integration on, heart rate in
+zone 2 or above blocks it: cycling, rowing or weights produce few steps, and without that check an
+effort could read as sitting still. At zone 2 only the raise is withheld; the resistance target
+starts at zone 3. Without heart-rate integration nothing can block it, so a long ride reads as
+inactivity. For a planned ride, set a high temporary target: with Allow Boost with high temp target
+off, the default, Boost stands aside for the length of the target, including the inactivity raise.
+
+Heart rate is turned into a zone by the Karvonen method, which measures effort as a share of your
+heart-rate reserve, the gap between your resting and maximum heart rates. Boost averages the last 15
+minutes of heart rate, subtracts your resting rate and divides by the reserve. Below 30% of the
+reserve is zone 1, 30 to 40% zone 2, 40 to 60% zone 3, 60 to 80% zone 4 and above 80% zone 5. The
+maximum defaults to 180 beats per minute and is a setting. The resting rate starts at the setting's
+60 and, once seven days of heart rate have been banked, is replaced by a learned daytime baseline:
+the median of each day's 10th-percentile waking heart rate. A trace that repeats one value is read as
+a stalled watch, not a heart rate. Without heart-rate integration only the step rows apply, and
+every bout of exercise counts as Active.
+
+V6 treats exercise as a reason for caution when it decides whether a meal is under way. While any
+exercise state is active the fast-carb confirm and the early primer are both held off, the meal
+score loses its small "not exercising" term, and the anticipatory pre-meal target is suppressed.
+
+Post-exercise recovery is off by default and is switched on under Post-exercise recovery in the
+advanced settings. When it is on, a bout of exercise lasting at least 10 minutes opens a recovery
+window when it ends. For that window Boost sets an Activity temporary target of 144 mg/dL (8.0
+mmol/L) unless you already have one running, multiplies its bolus cap and scale by 0.5, and halves
+V6's per-cycle insulin budget. The type of exercise adjusts the defaults:
+
+| Exercise type, as last classified before the bout ended | Window | Target | Bolus cap and scale |
+|---|---|---|---|
+| Vigorous aerobic | 2.5 h | 144 mg/dL | x 0.4 |
+| Resistance | 3 h | 154 mg/dL (8.6 mmol/L) | x 0.6 |
+| Anything else, including light and moderate aerobic and steps only | 2 h | 144 mg/dL | x 0.5 |
+
+If glucose rebounds after a low during the window (a low below 100 mg/dL, and glucose now 20
+mg/dL above it), Boost cancels the recovery target so the loop can respond to the rise. In the
+programme's own data the extra hypoglycaemia risk after exercise was modest, about 1.2 times the
+background rate, and roughly flat over the five hours measured, so the 2 hour default is a
+reasonable starting point rather than a measured optimum.
+
+## The learned models
+
+Every dosing decision in Boost comes from fixed rules and arithmetic, apart from two small
+gradient-boosted tree models (LightGBM) that the engine consults each cycle. Both were trained
+offline on about three million decision cycles from other people's Nightscout records, with
+participants held out during validation, and both ship inside the app as fixed trees. Nothing is
+trained on your phone and neither model changes as you use it.
+
+| | Hypo risk | Meal likelihood |
+|---|---|---|
+| Predicts | glucose below 70 mg/dL (3.9 mmol/L) for at least 15 min within 90 min | a rise of at least 50 mg/dL (2.8 mmol/L) within 90 min |
+| Size | 100 trees, 53 inputs | 50 trees, 8 inputs |
+| Training | 32 participants | 28 participants |
+| Accuracy, participants held out | AUC 0.83 | AUC 0.74 |
+| Accuracy in the field | AUC 0.66 (0.61 to 0.70) | AUC 0.72 (0.68 to 0.76) |
+| Direction | can only remove insulin | can add insulin |
+
+The hypo-risk model is a brake. Below a score of 0.30 it does nothing. Above that it shrinks V6's
+per-cycle insulin budget, by at most half at the default Hypo Caution and by up to three quarters
+at its maximum, and in the V1 engine it scales the microbolus down and blocks the four aggressive
+tiers above 0.60. The meal-likelihood model works the other way: it contributes a fifth of V6's
+meal score, which decides when a meal is confirmed and the larger doses begin; above 0.50 it
+releases V1's pre-meal hold; and above 0.30 it keeps the sleep detector from classifying you as
+asleep. The caps, Max IOB and the state machine bound what it can cause, not the model.
+
+If either model cannot be loaded, the engine carries on without it: no hypo damping, and the meal
+score's weight spread across its other terms. No setting turns them off. The hypo model's thresholds
+were set against the model it replaced in June 2026 and have not been re-set since. The full account,
+including what is known about their field behaviour and what cannot be reproduced, is in
+[the methods report](backtesting/reports/2026-09_boost_lgbm_methods.md).
+
+Everything else that learns from your data is ordinary statistics rather than a trained model:
+auto-config's settings, the learned bedtime and wake time, and the resting and daytime heart rates.
+The digital-twin forecast and the anticipation model run in shadow, logging what they would do and
+delivering nothing.
 
 ## Interactive tools
 
