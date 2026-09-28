@@ -7,6 +7,14 @@
 > decision. Do not run it on a pump unless you fully understand the code, accept the risk, and can
 > self-manage the consequences. You are the safety system.
 
+> This is the `Boost-endurance` branch. It is `dev` with changes for long, low-step endurance
+> exercise such as cycling, rowing or paddling, all live and all able only to reduce insulin. Compared
+> with `dev`, it adds an Endurance activity state that holds a ride together as one bout and reduces
+> the profile while it lasts, makes the post-exercise recovery window grow with the length of the
+> bout up to 12 hours, and applies that recovery after an endurance bout even when Post-exercise
+> recovery is switched off. It needs heart-rate integration. Nothing else differs from `dev`. The
+> details are in [Boost-endurance](docs/boost-endurance.md) and in the exercise section below.
+
 ## What Boost V6 is
 
 Boost keeps the entire AndroidAPS engine — basal, dynamic ISF, glucose predictions and every
@@ -130,6 +138,7 @@ over the target changes below.
 | Active | more than 420 steps in 5 min, 800 in 15, 1,200 in 30 or 1,800 in 60 | profile to 80% (Activity percentage), target 150 mg/dL (8.3 mmol/L) |
 | Vigorous aerobic | steps as above, at least 300 in the last 15 min, and heart rate zone 3 or higher | profile to 70% (Activity percentage less 10, never below 50%), target 150 mg/dL |
 | Resistance, or raised heart rate with few steps | heart rate zone 3 or 4 with fewer than 100 steps in 15 min | no profile reduction, target 160 mg/dL (8.9 mmol/L) |
+| Endurance (this branch) | 30 min of heart rate zone 2 or above with fewer than 100 steps in each 15 min, gaps up to 5 min allowed; lasts until 20 min pass without it | profile to 60% (Endurance percentage), target 150 mg/dL, or 160 where heart rate had already raised it; takes precedence over every other row while it lasts |
 | Stress (opt-in) | heart rate zone 2 or 3 with fewer than 30 steps in 15 min | target 160 mg/dL |
 | Inactive | fewer than 500 steps in the last hour, awake, outside the night window | profile to 130% (Inactivity percentage), which adds insulin |
 | No step data | the step feed has gone quiet | nothing changes; a dark feed is not read as inactivity |
@@ -137,8 +146,9 @@ over the target changes below.
 The inactive row is the only one that adds insulin. With heart-rate integration on, heart rate in
 zone 2 or above blocks it: cycling, rowing or weights produce few steps, and without that check an
 effort could read as sitting still. At zone 2 only the raise is withheld; the resistance target
-starts at zone 3. Without heart-rate integration nothing can block it, so a long ride reads as
-inactivity. For a planned ride, set a high temporary target: with Allow Boost with high temp target
+starts at zone 3. On this branch, once a ride passes 30 minutes it becomes Endurance and the profile
+is reduced instead. Without heart-rate integration nothing can block the raise, so a long ride
+reads as inactivity. For a planned ride, set a high temporary target: with Allow Boost with high temp target
 off, the default, Boost stands aside for the length of the target, including the inactivity raise.
 
 Heart rate is turned into a zone by the Karvonen method, which measures effort as a share of your
@@ -157,21 +167,27 @@ score loses its small "not exercising" term, and the anticipatory pre-meal targe
 
 Post-exercise recovery is off by default and is switched on under Post-exercise recovery in the
 advanced settings. When it is on, a bout of exercise lasting at least 10 minutes opens a recovery
-window when it ends. For that window Boost sets an Activity temporary target of 144 mg/dL (8.0
+window when it ends. On this branch an Endurance bout opens one whether the switch is on or not. For that window Boost sets an Activity temporary target of 144 mg/dL (8.0
 mmol/L) unless you already have one running, multiplies its bolus cap and scale by 0.5, and halves
-V6's per-cycle insulin budget. The type of exercise adjusts the defaults:
+V6's per-cycle insulin budget. The type of exercise adjusts the defaults. The windows below are for a
+bout of an hour or less; on this branch a longer bout multiplies the window by its length in hours,
+up to four times and never beyond 12 hours, so a ride of four hours or more gets 8 hours of recovery
+at the defaults.
 
 | Exercise type, as last classified before the bout ended | Window | Target | Bolus cap and scale |
 |---|---|---|---|
 | Vigorous aerobic | 2.5 h | 144 mg/dL | x 0.4 |
 | Resistance | 3 h | 154 mg/dL (8.6 mmol/L) | x 0.6 |
+| Endurance (this branch) | 2 h | 144 mg/dL | x 0.4 |
 | Anything else, including light and moderate aerobic and steps only | 2 h | 144 mg/dL | x 0.5 |
 
 If glucose rebounds after a low during the window (a low below 100 mg/dL, and glucose now 20
 mg/dL above it), Boost cancels the recovery target so the loop can respond to the rise. In the
 programme's own data the extra hypoglycaemia risk after exercise was modest, about 1.2 times the
 background rate, and roughly flat over the five hours measured, so the 2 hour default is a
-reasonable starting point rather than a measured optimum.
+reasonable starting point rather than a measured optimum. Those measurements come from ordinary
+exercise; nothing in them covers a ride of several hours, and the length scaling on this branch is
+a modelling choice rather than a measured result.
 
 ## The learned models
 
