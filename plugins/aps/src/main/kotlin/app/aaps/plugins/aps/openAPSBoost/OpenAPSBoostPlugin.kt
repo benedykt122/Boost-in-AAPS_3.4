@@ -292,6 +292,18 @@ open class OpenAPSBoostPlugin @Inject constructor(
         internal fun isSwitchToV6(lastEngineMode: String, v5Active: Boolean): Boolean =
             v5Active && lastEngineMode != ENGINE_MODE_V6
 
+        /**
+         * Post-exercise recovery window (Boost-endurance, 2026-09-28): the configured hours times the
+         * exercise-type multiplier, times the bout length in hours between 1 and 4, capped at 12 h. A
+         * bout of an hour or less keeps the unscaled window, so short exercise is unchanged.
+         */
+        internal fun recoveryWindowMs(recoveryHours: Double, typeMultiplier: Double, boutMinutes: Long): Long {
+            val lengthFactor = (boutMinutes / 60.0).coerceIn(1.0, 4.0)
+            return (recoveryHours * 3_600_000.0 * typeMultiplier * lengthFactor).toLong().coerceAtMost(RECOVERY_WINDOW_MAX_MS)
+        }
+
+        internal const val RECOVERY_WINDOW_MAX_MS = 12 * 3_600_000L
+
         internal const val ENGINE_MODE_V1 = "v1"
         internal const val ENGINE_MODE_V6 = "v6"
 
@@ -403,6 +415,10 @@ open class OpenAPSBoostPlugin @Inject constructor(
         }
     }
 
+    /** The post-exercise window is open, and either the recovery switch or an endurance bout opened it. */
+    private fun inRecoveryWindow(now: Long): Boolean =
+        now < recoveryWindowEnd && (postExerciseRecoveryEnabled || recoveryWindowFromEndurance)
+
     // Dynamic ISF
     // NOTE: all these Boost getters use preferences.getBoostDosing(...) (not .get) so Simple Mode
     // does NOT mask the user's / auto-config's stored dosing settings to factory defaults. The keys
@@ -441,6 +457,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
     // Heart rate integration
     private val hrIntegrationEnabled; get() = preferences.getBoostDosing(BooleanKey.ApsBoostHrIntegrationEnabled)
+    private val enduranceEnabled; get() = preferences.getBoostDosing(BooleanKey.ApsBoostEnduranceEnabled)
+    private val endurancePct; get() = preferences.getBoostDosing(DoubleKey.ApsBoostEndurancePct)
     private val hrMaxBpm; get() = preferences.getBoostDosing(IntKey.ApsBoostHrMaxBpm)
     private val hrRestingBpm; get() = preferences.getBoostDosing(IntKey.ApsBoostHrRestingBpm)
     private val hrWindowMinutes; get() = preferences.getBoostDosing(IntKey.ApsBoostHrWindowMinutes)
@@ -505,6 +523,10 @@ open class OpenAPSBoostPlugin @Inject constructor(
     @Volatile private var wasExerciseActive: Boolean = false
     @Volatile private var exerciseStartTime: Long = 0L
     @Volatile private var lastExerciseStateAtTransition: String = "ACTIVE"
+    // Boost-endurance: the detector state, and whether the open recovery window came from an
+    // endurance bout, which applies whatever the post-exercise recovery switch says.
+    @Volatile private var enduranceState = EnduranceDetector.State()
+    @Volatile private var recoveryWindowFromEndurance: Boolean = false
     @Volatile private var activeRecoveryScale: Double = 0.5
     @Volatile private var activeRecoveryTargetOffset: Double = 0.0
 
@@ -1110,6 +1132,26 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 activityState = "normal"
                 debug.append("\nActivity: normal (no adjustment)")
             }
+
+            // Boost-endurance: hold sustained low-step aerobic work as one state, whatever this
+            // cycle's step and heart-rate classification said. Removes insulin only.
+            enduranceState = if (enduranceEnabled && hrIntegrationEnabled)
+                EnduranceDetector.step(enduranceState, now, hrClassification?.hrZone, recentSteps15Min)
+            else EnduranceDetector.State()
+            if (enduranceState.active) {
+                activityState = "ENDURANCE"
+                currentProfileSwitch = if (profilePercent == 100) endurancePct.toInt() else profilePercent
+                // Never lower a target this cycle's state already raised (resistance and stress set 160),
+                // so endurance can only remove insulin relative to it.
+                if (!tempTargetSet) {
+                    val enduranceTarget = maxOf(150.0, activityTargetBg)
+                    activityMinBg = enduranceTarget
+                    activityMaxBg = enduranceTarget
+                    activityTargetBg = enduranceTarget
+                }
+                val sinceMin = enduranceState.activeSinceMs?.let { (now - it) / 60_000L } ?: 0L
+                debug.append("\nEndurance: ${sinceMin} min (HR ${hrClassification?.hrZone?.label ?: "none"}, 15m steps $recentSteps15Min) → profile $currentProfileSwitch%, target $activityTargetBg")
+            }
         }
 
         if (boostActive) {
@@ -1308,16 +1350,21 @@ open class OpenAPSBoostPlugin @Inject constructor(
         // 1b. Post-exercise recovery transition detection
         // HR-aware: all exercise states (aerobic, resistance) trigger recovery, not just "ACTIVE".
         // Recovery window duration, target BG, and SMB scale are adjusted per exercise type.
-        if (postExerciseRecoveryEnabled) {
-            val exerciseStateSet = setOf("ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE")
+        // Boost-endurance: an endurance bout gets its recovery window whatever the switch says, so the
+        // transition tracking runs whenever either can produce one.
+        if (postExerciseRecoveryEnabled || (enduranceEnabled && hrIntegrationEnabled)) {
+            val exerciseStateSet = setOf("ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE", "ENDURANCE")
             val isCurrentlyActive = activityResult.activityState in exerciseStateSet
             if (isCurrentlyActive && !wasExerciseActive) {
-                exerciseStartTime = now
+                // An endurance bout began when its heart rate first qualified, up to 30 min before the
+                // state was declared.
+                exerciseStartTime = if (activityResult.activityState == "ENDURANCE") enduranceState.activeSinceMs ?: now else now
                 aapsLogger.debug(LTag.APS, "Boost post-exercise: exercise started (${activityResult.activityState}) at ${dateUtil.dateAndTimeString(exerciseStartTime)}")
             } else if (!isCurrentlyActive && wasExerciseActive) {
                 val exerciseDurationMin = (now - exerciseStartTime) / 60_000L
                 aapsLogger.debug(LTag.APS, "Boost post-exercise: exercise ended (was $lastExerciseStateAtTransition) after ${exerciseDurationMin}min")
-                if (exerciseDurationMin >= postExerciseMinDuration) {
+                val recoveryAllowed = postExerciseRecoveryEnabled || lastExerciseStateAtTransition == "ENDURANCE"
+                if (recoveryAllowed && exerciseDurationMin >= postExerciseMinDuration) {
                     // Adjust recovery parameters based on exercise type (HR-classified or step-only).
                     // Multipliers are evidence-based relative to the user's configured baseline:
                     //   VIGOROUS_AEROBIC  — high immediate hypo risk: longer window, more SMB suppression
@@ -1329,9 +1376,13 @@ open class OpenAPSBoostPlugin @Inject constructor(
                         "VIGOROUS_AEROBIC" -> Triple(1.25, 0.0,  0.8)
                         "RESISTANCE"       -> Triple(1.5,  10.0, 1.2)
                         "LIGHT_AEROBIC"    -> Triple(0.5,  0.0,  1.4)
+                        "ENDURANCE"        -> Triple(1.0,  0.0,  0.8)
                         else               -> Triple(1.0,  0.0,  1.0)
                     }
-                    val recoveryMillis = (postExerciseRecoveryHours * 3600_000L * windowMultiplier).toLong()
+                    // Boost-endurance: the window grows with the bout, since insulin sensitivity after
+                    // hours of aerobic work lasts well beyond the default two hours.
+                    val recoveryMillis = recoveryWindowMs(postExerciseRecoveryHours, windowMultiplier, exerciseDurationMin)
+                    recoveryWindowFromEndurance = lastExerciseStateAtTransition == "ENDURANCE"
                     val recoveryTargetMgdl = postExerciseRecoveryTarget + targetOffsetMgdl
                     activeRecoveryScale = (postExerciseRecoveryScale * scaleMultiplier).coerceIn(0.1, 1.0)
                     activeRecoveryTargetOffset = targetOffsetMgdl
@@ -1484,7 +1535,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
             val leadMaxMin = preferences.getBoostDosing(DoubleKey.ApsBoostV6PreMealLeadMin).toInt()
             val hit = MealTimeLearner.preMealWindow(mealTimeHistoryCached, nowMin, offsetMs, leadMaxMin) ?: return@run
             val exerciseNow = activityResult.activityState in setOf("ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE", "STRESS")
-            val inRecovery = postExerciseRecoveryEnabled && now < recoveryWindowEnd
+            val inRecovery = inRecoveryWindow(now)
             if (exerciseNow || inRecovery) {
                 v6PreMealReason = "V6 pre-meal SUPPRESSED (${if (exerciseNow) "exercise" else "recovery"}); "
                 return@run
@@ -1567,14 +1618,14 @@ open class OpenAPSBoostPlugin @Inject constructor(
             // Boost SMB fields
             boostActive = activityResult.boostActive,
             profileSwitch = activityResult.profileSwitch,
-            boost_bolus = if (postExerciseRecoveryEnabled && now < recoveryWindowEnd) {
+            boost_bolus = if (inRecoveryWindow(now)) {
                 val scaled = boostBolus * activeRecoveryScale
                 aapsLogger.debug(LTag.APS, "Boost post-exercise recovery [$lastExerciseStateAtTransition]: boost_bolus $boostBolus → $scaled (scale=$activeRecoveryScale)")
                 scaled
             } else boostBolus,
             boost_maxIOB = boostMaxIob,
             Boost_InsulinReq = boostInsulinReqPct,
-            boost_scale = if (postExerciseRecoveryEnabled && now < recoveryWindowEnd) {
+            boost_scale = if (inRecoveryWindow(now)) {
                 val scaled = boostScale * activeRecoveryScale
                 aapsLogger.debug(LTag.APS, "Boost post-exercise recovery [$lastExerciseStateAtTransition]: boost_scale $boostScale → $scaled (scale=$activeRecoveryScale)")
                 scaled
@@ -1607,7 +1658,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
             // V3MLG3's exact block (OpenAPSBoostV3MLG3Plugin, v5_* assignments) via the shared
             // helpers below ([v5ExerciseActive]/[v5InPostExerciseWindow]).
             v5_exerciseActive = v5ExerciseActive(activityResult.activityState),
-            v5_inPostExerciseWindow = v5InPostExerciseWindow(postExerciseRecoveryEnabled, now, recoveryWindowEnd),
+            v5_inPostExerciseWindow = v5InPostExerciseWindow(postExerciseRecoveryEnabled || recoveryWindowFromEndurance, now, recoveryWindowEnd),
             v5_exerciseSubclass = activityResult.activityState,
         )
 
@@ -2817,6 +2868,8 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsBoostActivitySteps30, dialogMessage = R.string.boost_activity_steps_30_summary, title = R.string.boost_activity_steps_30_title))
                     addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsBoostActivitySteps60, dialogMessage = R.string.boost_activity_steps_60_summary, title = R.string.boost_activity_steps_60_title))
                     addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostActivityPct, dialogMessage = R.string.boost_activity_pct_summary, title = R.string.boost_activity_pct_title))
+                    addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsBoostEnduranceEnabled, summary = R.string.boost_endurance_enabled_summary, title = R.string.boost_endurance_enabled_title))
+                    addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsBoostEndurancePct, dialogMessage = R.string.boost_endurance_pct_summary, title = R.string.boost_endurance_pct_title))
                 })
 
                 // 4b. Heart Rate Integration
@@ -2953,7 +3006,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
  * deliberately EXCLUDES "STRESS" (stress shouldn't start a recovery window).
  */
 internal val V5_EXERCISE_STATES = setOf(
-    "ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE", "STRESS"
+    "ACTIVE", "VIGOROUS_AEROBIC", "MODERATE_AEROBIC", "LIGHT_AEROBIC", "RESISTANCE", "STRESS", "ENDURANCE"
 )
 
 /** [OapsProfileBoost.v5_exerciseActive] from V1's activity classification. */

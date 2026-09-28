@@ -175,6 +175,10 @@ enum class BooleanKey(
     ApsBoostAutosensWhenNoTdd("boost_autosens_when_no_tdd", true, defaultedBySM = true),
     ApsBoostHrIntegrationEnabled("boost_hr_integration_enabled", false, defaultedBySM = true),
     ApsBoostHrStressDetection("boost_hr_stress_detection", false, defaultedBySM = true),
+    // Boost-endurance (2026-09-28): hold sustained low-step aerobic work (cycling, rowing) as one
+    // ENDURANCE state with a profile reduction, and give it a recovery window scaled by its length.
+    // Needs heart-rate integration. Removes insulin only.
+    ApsBoostEnduranceEnabled("boost_endurance_enabled", true, defaultedBySM = true, dependency = ApsBoostHrIntegrationEnabled),
 
     MaintenanceEnableFabric("enable_fabric2", true, defaultedBySM = true, hideParentScreenIfHidden = true),
 

@@ -136,6 +136,10 @@
     <string name="boost_activity_steps_60_summary">Steps in 60 min above which user is active. Default: 1800</string>
     <string name="boost_activity_pct_title">Activity Profile Percent</string>
     <string name="boost_activity_pct_summary">Profile percentage when active. Default: 80</string>
+    <string name="boost_endurance_enabled_title">Endurance exercise (cycling, rowing)</string>
+    <string name="boost_endurance_enabled_summary">Needs heart-rate integration. After 30 minutes of heart rate in zone 2 or above with fewer than 100 steps every 15 minutes, Boost treats the effort as endurance exercise: profile to Endurance Profile Percent and target 150 mg/dL (8.3 mmol/L), held through descents and stops until 20 minutes pass without it. When it ends, a recovery window follows whose length grows with the ride, up to 12 hours, whether or not Post-exercise recovery is switched on. Removes insulin only.</string>
+    <string name="boost_endurance_pct_title">Endurance Profile Percent</string>
+    <string name="boost_endurance_pct_summary">Profile percentage during endurance exercise. Lower gives less insulin. Default: 60</string>
 
     <!-- Boost Dynamic ISF -->
     <string name="boost_dynisf_title">Dynamic ISF (TDD-based)</string>

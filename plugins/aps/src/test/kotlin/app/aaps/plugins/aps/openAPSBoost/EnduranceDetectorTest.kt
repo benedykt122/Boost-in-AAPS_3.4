@@ -1,0 +1,81 @@
+package app.aaps.plugins.aps.openAPSBoost
+
+import app.aaps.plugins.aps.openAPSBoost.HrActivityCalculator.HrZone
+import app.aaps.plugins.aps.openAPSBoost.OpenAPSBoostPlugin.Companion.RECOVERY_WINDOW_MAX_MS
+import app.aaps.plugins.aps.openAPSBoost.OpenAPSBoostPlugin.Companion.recoveryWindowMs
+import com.google.common.truth.Truth.assertThat
+import org.junit.jupiter.api.Test
+
+/**
+ * Boost-endurance (2026-09-28). A long ride is zone 2 to 4 with almost no steps, broken by descents
+ * and stops. These pin that it becomes one ENDURANCE state after 30 minutes, survives the breaks,
+ * ends after 20 quiet minutes, and that its recovery window grows with its length.
+ */
+class EnduranceDetectorTest {
+
+    private val t0 = 1_800_000_000_000L
+    private fun min(m: Int) = t0 + m * 60_000L
+
+    /** Steps the detector once a minute from [fromMin] until [toMin] inclusive at one zone and step count. */
+    private fun run(start: EnduranceDetector.State, fromMin: Int, toMin: Int, zone: HrZone?, steps: Int = 10): EnduranceDetector.State {
+        var s = start
+        for (m in fromMin..toMin) s = EnduranceDetector.step(s, min(m), zone, steps)
+        return s
+    }
+
+    @Test fun `thirty minutes of zone 2 with few steps becomes endurance, not sooner`() {
+        val at29 = run(EnduranceDetector.State(), 0, 29, HrZone.ZONE_2_LIGHT)
+        assertThat(at29.active).isFalse()
+        val at30 = EnduranceDetector.step(at29, min(30), HrZone.ZONE_2_LIGHT, 10)
+        assertThat(at30.active).isTrue()
+        assertThat(at30.activeSinceMs).isEqualTo(min(0))
+    }
+
+    @Test fun `zone 1 or walking does not qualify`() {
+        assertThat(run(EnduranceDetector.State(), 0, 60, HrZone.ZONE_1_VERY_LIGHT).active).isFalse()
+        assertThat(run(EnduranceDetector.State(), 0, 60, HrZone.ZONE_3_MODERATE, steps = 400).active).isFalse()
+        assertThat(run(EnduranceDetector.State(), 0, 60, null).active).isFalse()
+    }
+
+    @Test fun `a short dip during entry does not reset the clock, a long one does`() {
+        var s = run(EnduranceDetector.State(), 0, 15, HrZone.ZONE_3_MODERATE)
+        s = run(s, 16, 19, HrZone.ZONE_1_VERY_LIGHT)          // 4 min stop
+        s = run(s, 20, 30, HrZone.ZONE_3_MODERATE)
+        assertThat(s.active).isTrue()
+
+        var r = run(EnduranceDetector.State(), 0, 15, HrZone.ZONE_3_MODERATE)
+        r = run(r, 16, 25, HrZone.ZONE_1_VERY_LIGHT)          // 10 min stop
+        r = run(r, 26, 40, HrZone.ZONE_3_MODERATE)
+        assertThat(r.active).isFalse()
+    }
+
+    @Test fun `once active it holds through a 15 minute stop and ends after 20 quiet minutes`() {
+        var s = run(EnduranceDetector.State(), 0, 40, HrZone.ZONE_3_MODERATE)
+        s = run(s, 41, 55, HrZone.ZONE_1_VERY_LIGHT, steps = 300)   // cafe stop, walking about
+        assertThat(s.active).isTrue()
+        s = run(s, 56, 90, HrZone.ZONE_2_LIGHT)
+        assertThat(s.active).isTrue()
+        assertThat(s.activeSinceMs).isEqualTo(min(0))
+        s = run(s, 91, 109, HrZone.ZONE_1_VERY_LIGHT)
+        assertThat(s.active).isTrue()
+        s = EnduranceDetector.step(s, min(110), HrZone.ZONE_1_VERY_LIGHT, 10)
+        assertThat(s.active).isFalse()
+    }
+
+    @Test fun `a long gap in stepping ends an active bout even if the next cycle qualifies`() {
+        val s = run(EnduranceDetector.State(), 0, 60, HrZone.ZONE_3_MODERATE)
+        val afterGap = EnduranceDetector.step(s, min(60 + 8 * 60), HrZone.ZONE_2_LIGHT, 10)
+        assertThat(afterGap.active).isFalse()
+        assertThat(afterGap.candidateSinceMs).isEqualTo(min(60 + 8 * 60))
+    }
+
+    @Test fun `recovery window is unchanged up to an hour and grows with the bout, capped at 12 h`() {
+        val h = 3_600_000L
+        assertThat(recoveryWindowMs(2.0, 1.0, 45)).isEqualTo(2 * h)
+        assertThat(recoveryWindowMs(2.0, 1.0, 60)).isEqualTo(2 * h)
+        assertThat(recoveryWindowMs(2.0, 1.0, 180)).isEqualTo(6 * h)
+        assertThat(recoveryWindowMs(2.0, 1.0, 300)).isEqualTo(8 * h)       // length factor capped at 4
+        assertThat(recoveryWindowMs(4.0, 1.5, 300)).isEqualTo(RECOVERY_WINDOW_MAX_MS)
+        assertThat(recoveryWindowMs(2.0, 1.25, 30)).isEqualTo((2.5 * h).toLong())
+    }
+}
