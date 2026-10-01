@@ -304,6 +304,19 @@ open class OpenAPSBoostPlugin @Inject constructor(
 
         internal const val RECOVERY_WINDOW_MAX_MS = 12 * 3_600_000L
 
+        /**
+         * Whether the active TempTarget is the post-exercise recovery target Boost inserted, the only
+         * one the hypo-rebound auto-cancel may remove (2026-10-01). The check used to be the ACTIVITY
+         * reason alone, which is also the reason AAPS gives a target set from its activity button, so
+         * a high target set to sit out a rescue rebound was cancelled within one cycle and Boost
+         * re-engaged: in the field it then gave a 2.175 U V6 shot at 192 mg/dL forty minutes after a
+         * low of 44. Matching the start time Boost recorded at insert means a user's target is never
+         * touched.
+         */
+        internal fun isBoostRecoveryTt(activeTtStartMs: Long?, activeTtReason: TT.Reason?, boostRecoveryTtStartMs: Long?): Boolean =
+            activeTtStartMs != null && boostRecoveryTtStartMs != null &&
+                activeTtReason == TT.Reason.ACTIVITY && activeTtStartMs == boostRecoveryTtStartMs
+
         internal const val ENGINE_MODE_V1 = "v1"
         internal const val ENGINE_MODE_V6 = "v6"
 
@@ -527,6 +540,10 @@ open class OpenAPSBoostPlugin @Inject constructor(
     // endurance bout, which applies whatever the post-exercise recovery switch says.
     @Volatile private var enduranceState = EnduranceDetector.State()
     @Volatile private var recoveryWindowFromEndurance: Boolean = false
+    // Start time of the recovery TempTarget Boost itself inserted, so the hypo-rebound auto-cancel
+    // can tell it apart from one the user set. Null after a restart, which leaves Boost's own target
+    // to expire on its own (the safe direction).
+    @Volatile private var boostRecoveryTtStartMs: Long? = null
     @Volatile private var activeRecoveryScale: Double = 0.5
     @Volatile private var activeRecoveryTargetOffset: Double = 0.0
 
@@ -1389,6 +1406,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
                     recoveryWindowEnd = now + recoveryMillis
                     aapsLogger.debug(LTag.APS, "Boost post-exercise [$lastExerciseStateAtTransition]: window=${recoveryMillis / 60_000}min target=${recoveryTargetMgdl.toInt()}mg/dL SMBscale=$activeRecoveryScale")
                     if (persistenceLayer.getTemporaryTargetActiveAt(now) == null) {
+                        boostRecoveryTtStartMs = now
                         val tt = TT(
                             timestamp = now,
                             duration = recoveryMillis,
@@ -1493,7 +1511,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
         // Cancel the recovery TT and reset target to profile so Boost can re-engage.
         if (recentLowBG < 100.0 && glucoseStatus.glucose > recentLowBG + 20) {
             val activeTt = persistenceLayer.getTemporaryTargetActiveAt(now)
-            if (activeTt != null && activeTt.reason == TT.Reason.ACTIVITY) {
+            if (isBoostRecoveryTt(activeTt?.timestamp, activeTt?.reason, boostRecoveryTtStartMs)) {
                 aapsLogger.debug(LTag.APS, "Boost: cancelling recovery TempTarget — hypo rebound detected (recentLow=${recentLowBG.toInt()}, BG now ${glucoseStatus.glucose.toInt()})")
                 disposable += persistenceLayer.cancelCurrentTemporaryTargetIfAny(
                     timestamp = now,
@@ -1504,6 +1522,7 @@ open class OpenAPSBoostPlugin @Inject constructor(
                 ).subscribe()
                 // Also clear the recovery window so SMB reduction doesn't persist
                 recoveryWindowEnd = 0L
+                boostRecoveryTtStartMs = null
                 // Reset targets back to profile values
                 isTempTarget = false
                 minBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetLowMgdl(), 0.1), app.aaps.core.ui.R.string.profile_low_target, HardLimits.LIMIT_MIN_BG[0], HardLimits.LIMIT_MIN_BG[1])
